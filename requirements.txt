@@ -1,0 +1,4 @@
+# mediapipe 0.10.21: neuere Versionen werden von Windows Smart App Control blockiert
+mediapipe==0.10.21
+numpy<2
+pillow

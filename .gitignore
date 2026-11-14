@@ -1,0 +1,13 @@
+# Persönliche Kalibrierung (Körperdaten, Felder, Einstellungen)
+posen.json
+posen.json.tmp
+
+# Pose-Modell wird beim ersten Start automatisch geladen
+modelle/
+*.part
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
