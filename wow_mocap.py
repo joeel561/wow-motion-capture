@@ -82,6 +82,11 @@ ZONE_FROM_LABEL = {v: k for k, v in ZONE_LABELS.items()}
 MODE_LABELS = {"antippen": "Antippen (einmal)", "halten": "Halten (solange aktiv)"}
 MODE_SHORT = {"antippen": "Antippen", "halten": "Halten"}
 MODE_FROM_LABEL = {v: k for k, v in MODE_LABELS.items()}
+ART_LABELS = {"haltung": "Haltung (Pose stillhalten)",
+              "bewegung": "Bewegung (z. B. auf der Stelle gehen)"}
+ART_SHORT = {"haltung": "Haltung", "bewegung": "Bewegung"}
+ART_FROM_LABEL = {v: k for k, v in ART_LABELS.items()}
+POSE_KEYS = ("name", "zone", "keys", "mode", "art", "empf")
 
 TOGGLE_KEYS = {"F12": 0x7B, "F11": 0x7A, "F10": 0x79, "F9": 0x78,
                "Pause": 0x13, "Rollen": 0x91, "Einfg": 0x2D}
@@ -374,8 +379,60 @@ def zone_features(raws, zone):
     return pts, vis
 
 
+def sample_distances(pa, va, pb, vb):
+    """Abstand jeder Aufnahme aus A zu jeder aus B (Na x Nb), gewichtet wie im Klassifikator."""
+    w = np.minimum(vb[None], va[:, None])
+    d2 = ((pb[None] - pa[:, None]) ** 2).sum(axis=3)
+    return np.sqrt((w * d2).sum(axis=2) / (w.sum(axis=2) + 1e-6))
+
+
+def similar_poses(poses, name, limit=0.35, close=0.25, close_frac=0.15):
+    """Welche Posen im selben Bereich kommen der Pose `name` zu nahe?
+    -> [(Name, typischer Abstand, Anteil sehr naher Aufnahmen)]"""
+    pose = next((p for p in poses if p["name"] == name), None)
+    if not pose or pose["zone"] == REST_ZONE or pose.get("art") == "bewegung" or not pose["samples"]:
+        return []
+    zone = pose["zone"]
+    pa, va = zone_features(np.asarray(pose["samples"], np.float32), zone)
+    out = []
+    for other in poses:
+        if other is pose or not other["samples"] or other.get("art") == "bewegung":
+            continue
+        if other["zone"] not in (zone, REST_ZONE):
+            continue
+        pb, vb = zone_features(np.asarray(other["samples"], np.float32), zone)
+        d = sample_distances(pa, va, pb, vb).min(axis=1)
+        med, frac = float(np.median(d)), float((d < close).mean())
+        if med < limit or frac > close_frac:
+            out.append((other["name"], med, frac))
+    return sorted(out, key=lambda t: t[1])
+
+
+def similarity_warning(poses, name):
+    hits = similar_poses(poses, name)
+    if not hits:
+        return None
+    lines = []
+    for other, med, frac in hits:
+        if med < 0.35:
+            lines.append(f"• „{name}“ sieht fast aus wie „{other}“ (Abstand {med:.2f}).")
+        else:
+            lines.append(f"• {frac:.0%} der Aufnahmen von „{name}“ sehen aus wie „{other}“ "
+                         "(wahrscheinlich Bewegung oder Übergang aufgenommen).")
+    return ("\n".join(lines) + "\n\nDadurch kann die Pose auslösen, obwohl du sie nicht machst. "
+            "Tipp: Pose deutlicher machen und während der Aufnahme ruhig halten, dann die alte "
+            "Pose löschen und neu aufnehmen. Für Bewegungen (z. B. Gehen) „Erkennung: Bewegung“ wählen.")
+
+
 class ZoneModel:
     """k-nächste-Nachbarn über alle kalibrierten Samples eines Bereichs."""
+
+    # Eine Haltung zählt nur, wenn sie deutlich näher ist als die Ruhepose.
+    REST_MARGIN = 0.8
+
+    # Aufnahmen einer Pose, die näher als dieser Anteil ihres typischen Abstands an
+    # der Ruhepose liegen, gelten als Übergang (Hinein-/Herausgehen) und werden ignoriert.
+    TRANSITION_CUT = 0.5
 
     def __init__(self, zone, poses):
         raws, labels = [], []
@@ -386,7 +443,29 @@ class ZoneModel:
         self.zone = zone
         self.labels = np.array(labels)
         self.names = sorted(set(labels))
+        self.rest_names = {p["name"] for p in poses if p["zone"] == REST_ZONE}
+        self.sens = {p["name"]: float(p.get("empf", 1.0)) for p in poses}
         self.pts, self.vis = zone_features(np.asarray(raws, dtype=np.float32), zone)
+        self.removed = {}
+        self._drop_transitions()
+
+    def _drop_transitions(self):
+        rest_mask = np.isin(self.labels, list(self.rest_names))
+        if not rest_mask.any():
+            return
+        keep = np.ones(len(self.labels), dtype=bool)
+        for name in self.names:
+            if name in self.rest_names:
+                continue
+            idx = np.where(self.labels == name)[0]
+            d = sample_distances(self.pts[idx], self.vis[idx],
+                                 self.pts[rest_mask], self.vis[rest_mask]).min(axis=1)
+            drop = d < self.TRANSITION_CUT * np.median(d)
+            if (~drop).sum() < 5:  # immer genug Aufnahmen übrig lassen
+                continue
+            keep[idx[drop]] = False
+            self.removed[name] = int(drop.sum())
+        self.labels, self.pts, self.vis = self.labels[keep], self.pts[keep], self.vis[keep]
 
     def classify(self, raw, k, threshold):
         pts, vis = zone_features(raw[None], self.zone)
@@ -401,10 +480,76 @@ class ZoneModel:
         kk = max(1, min(k, len(dist)))
         nearest = np.argpartition(dist, kk - 1)[:kk]
         best = Counter(self.labels[nearest].tolist()).most_common(1)[0][0]
-        best_dist = dict(ranking)[best]
-        if best_dist > threshold:
+        d = dict(ranking)
+        best_dist = d[best]
+        # Empfindlichkeit pro Pose: < 1 = strenger, > 1 = lockerer
+        if best_dist > threshold * self.sens.get(best, 1.0):
             best = None
+        elif best not in self.rest_names and self.rest_names:
+            rest_dist = min(d[n] for n in self.rest_names)
+            if best_dist > rest_dist * self.REST_MARGIN:
+                best = None
         return ZoneResult(best, best_dist, ranking)
+
+
+# --------------------------------------------------------------------------
+# Bewegungserkennung (z. B. auf der Stelle gehen)
+# --------------------------------------------------------------------------
+MOTION_WINDOW_S = 0.7      # über diese Zeit wird die Bewegungsstärke gemittelt
+DEFAULT_REST_ENERGY = 0.2  # typisches Messrauschen im Stillstand (Rumpflängen/s)
+MotionInfo = namedtuple("MotionInfo", "name zone threshold energy rest_energy info")
+
+
+def _frame_steps(pts, vis):
+    """Bewegung von Frame zu Frame (nur x/y, Tiefe ist zu verrauscht)."""
+    xy = pts[..., :2]
+    wv = np.minimum(vis[1:], vis[:-1])
+    d2 = ((xy[1:] - xy[:-1]) ** 2).sum(axis=2)
+    return np.sqrt((wv * d2).sum(axis=1) / (wv.sum(axis=1) + 1e-6))
+
+
+def recorded_energy(pose, zone):
+    """Typische Bewegungsstärke einer Aufnahme in Rumpflängen pro Sekunde."""
+    if len(pose["samples"]) < 10:
+        return 0.0
+    pts, vis = zone_features(np.asarray(pose["samples"], np.float32), zone)
+    steps = _frame_steps(pts, vis)
+    fps = float(pose.get("fps", 30.0))
+    win = max(3, min(len(steps), int(round(MOTION_WINDOW_S * fps))))
+    energy = np.convolve(steps, np.ones(win) / win, mode="valid") * fps
+    return float(np.median(energy))
+
+
+def motion_threshold(pose_e, rest_e, sens):
+    """Schwelle zwischen Stillstand und kalibrierter Bewegung. sens > 1 = empfindlicher."""
+    thr = rest_e + (pose_e - rest_e) * 0.35 / max(sens, 0.1)
+    return max(thr, rest_e * 1.6)
+
+
+class MotionTracker:
+    """Misst laufend die Bewegungsstärke eines Körperbereichs."""
+
+    def __init__(self, zone):
+        self.zone = zone
+        self.hist = []  # (Zeit, Punkte, Sichtbarkeit)
+
+    def update(self, raw, now):
+        if raw is None:
+            self.hist.clear()
+            return None
+        pts, vis = zone_features(raw[None], self.zone)
+        if vis[0].mean() < 0.35:
+            self.hist.clear()
+            return None
+        self.hist.append((now, pts[0], vis[0]))
+        while self.hist and now - self.hist[0][0] > MOTION_WINDOW_S:
+            self.hist.pop(0)
+        span = self.hist[-1][0] - self.hist[0][0] if len(self.hist) > 1 else 0.0
+        if span < MOTION_WINDOW_S * 0.6:
+            return None
+        pts = np.stack([h[1] for h in self.hist])
+        vis = np.stack([h[2] for h in self.hist])
+        return float(_frame_steps(pts, vis).sum() / span)
 
 
 def build_models(poses):
@@ -418,10 +563,23 @@ def build_models(poses):
                                     p.get("mode", "antippen"))
     models = {}
     for zone in ZONES:
-        members = [p for p in poses if p["samples"] and p["zone"] in (zone, REST_ZONE)]
+        members = [p for p in poses if p["samples"] and p["zone"] in (zone, REST_ZONE)
+                   and p.get("art", "haltung") != "bewegung"]
         if any(p["zone"] == zone for p in members):
             models[zone] = ZoneModel(zone, members)
-    return models, infos
+
+    motions = []
+    rest = [p for p in poses if p["zone"] == REST_ZONE and p["samples"]]
+    for p in poses:
+        if p.get("art") != "bewegung" or p["zone"] == REST_ZONE or not p["samples"]:
+            continue
+        rest_e = (float(np.median([recorded_energy(r, p["zone"]) for r in rest]))
+                  if rest else DEFAULT_REST_ENERGY)
+        rest_e = max(rest_e, 0.05)
+        pose_e = recorded_energy(p, p["zone"])
+        thr = motion_threshold(pose_e, rest_e, float(p.get("empf", 1.0)))
+        motions.append(MotionInfo(p["name"], p["zone"], thr, pose_e, rest_e, infos[p["name"]]))
+    return models, infos, motions
 
 
 def build_fields(felder):
@@ -535,6 +693,8 @@ class Tracker(threading.Thread):
         self.events = queue.Queue()
         self.models, self.infos = {}, {}
         self.fields = []
+        self.motions = []
+        self.motion_trackers = {}  # Bereich -> MotionTracker
         self.selected_field = None
         self.enabled = False
         self.rec = None
@@ -552,9 +712,9 @@ class Tracker(threading.Thread):
         self.error = ""
 
     # --- Aufrufe aus der Oberfläche ---
-    def set_models(self, models, infos):
+    def set_models(self, models, infos, motions=()):
         with self.lock:
-            self.models, self.infos = models, infos
+            self.models, self.infos, self.motions = models, infos, list(motions)
             self._models_changed = True
 
     def set_fields(self, fields):
@@ -610,6 +770,7 @@ class Tracker(threading.Thread):
             return ("rec", frac, len(rec["samples"]))
         self.rec = None
         beep((1300, 100), (1600, 160))
+        rec["target"]["fps"] = round(len(rec["samples"]) / max(rec["end"] - rec["start"], 0.1), 1)
         self.events.put(("recorded", rec["target"], rec["samples"]))
         return None
 
@@ -743,7 +904,7 @@ class Tracker(threading.Thread):
         now = time.monotonic()
         self._check_toggle()
         with self.lock:
-            models, infos, fields = self.models, self.infos, self.fields
+            models, infos, fields, motions = self.models, self.infos, self.fields, self.motions
             changed, self._models_changed = self._models_changed, False
         if changed:
             self.engine.release_all()
@@ -773,6 +934,19 @@ class Tracker(threading.Thread):
                 info = None
             self._update_slot(zone, name, info, allowed, stable_n)
 
+        # Bewegungen: Stärke pro Bereich messen, mit kalibrierter Schwelle vergleichen
+        energies = {}
+        for zone in {m.zone for m in motions}:
+            mt = self.motion_trackers.setdefault(zone, MotionTracker(zone))
+            energies[zone] = mt.update(raw, now)
+        motion_status = {}
+        for m in motions:
+            e = energies.get(m.zone)
+            moving = e is not None and e >= m.threshold
+            motion_status[m.name] = (e, m.threshold, moving)
+            self._update_slot("bew:" + m.name, m.name if moving else None,
+                              m.info if moving else None, allowed, stable_n)
+
         active_fields = set()
         for f in fields:
             inside = raw is not None and field_hit(raw, aspect, f)
@@ -801,6 +975,7 @@ class Tracker(threading.Thread):
             "zones": {z: {"pose": r.name, "dist": r.dist, "ranking": r.ranking[:4]}
                       for z, r in results.items()},
             "fields": sorted(active_fields),
+            "motions": motion_status,
             "held": self.engine.held_text(),
             "last_action": self.last_action,
             "foreign_title": self.foreign_title,
@@ -968,18 +1143,20 @@ class App:
                   ).pack(fill="x", pady=(10, 0))
 
     def _build_poses_tab(self, f):
-        cols = ("bereich", "taste", "modus", "samples")
+        cols = ("bereich", "art", "taste", "modus", "samples")
         self.tree = ttk.Treeview(f, columns=cols, height=7, selectmode="browse")
         self.tree.heading("#0", text="Pose")
         self.tree.heading("bereich", text="Bereich")
         self.tree.heading("taste", text="Taste")
         self.tree.heading("modus", text="Modus")
+        self.tree.heading("art", text="Erkennung")
         self.tree.heading("samples", text="Samples")
-        self.tree.column("#0", width=120)
-        self.tree.column("bereich", width=110)
-        self.tree.column("taste", width=70)
-        self.tree.column("modus", width=70)
-        self.tree.column("samples", width=60, anchor="e")
+        self.tree.column("#0", width=110)
+        self.tree.column("bereich", width=100)
+        self.tree.column("art", width=70)
+        self.tree.column("taste", width=50)
+        self.tree.column("modus", width=65)
+        self.tree.column("samples", width=55, anchor="e")
         self.tree.pack(fill="x")
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
 
@@ -1010,12 +1187,30 @@ class App:
         ttk.Combobox(ed, textvariable=self.mode_var, state="readonly",
                      values=list(MODE_LABELS.values())).grid(row=4, column=1, sticky="ew", pady=2)
 
+        self.art_var = tk.StringVar(value=ART_LABELS["haltung"])
+        ttk.Label(ed, text="Erkennung").grid(row=5, column=0, sticky="w", pady=2)
+        ttk.Combobox(ed, textvariable=self.art_var, state="readonly",
+                     values=list(ART_LABELS.values())).grid(row=5, column=1, sticky="ew", pady=2)
+        ttk.Label(ed, text="Empfindlichk.").grid(row=6, column=0, sticky="w", pady=2)
+        emp = ttk.Frame(ed)
+        emp.grid(row=6, column=1, sticky="ew", pady=2)
+        self.empf_var = tk.DoubleVar(value=1.0)
+        self.empf_lbl = ttk.Label(emp, text="1.0", width=4)
+        ttk.Scale(emp, from_=0.3, to=2.0, variable=self.empf_var,
+                  command=lambda _=None: self.empf_lbl.config(text=f"{self.empf_var.get():.1f}")
+                  ).pack(side="left", fill="x", expand=True)
+        self.empf_lbl.pack(side="left", padx=(6, 0))
+        ttk.Label(ed, foreground="#777", wraplength=340, justify="left",
+                  text="Kleiner = löst schwerer aus, größer = leichter. "
+                       "Nach Änderung „Änderungen übernehmen“ klicken."
+                  ).grid(row=7, column=1, sticky="w")
+
         b = ttk.Frame(ed)
-        b.grid(row=5, column=0, columnspan=2, sticky="ew", pady=(8, 0))
+        b.grid(row=8, column=0, columnspan=2, sticky="ew", pady=(8, 0))
         ttk.Button(b, text="● Neue Pose aufnehmen", command=self._record_new).pack(side="left")
         ttk.Button(b, text="Änderungen übernehmen", command=self._apply_edit).pack(side="left", padx=4)
         b2 = ttk.Frame(ed)
-        b2.grid(row=6, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+        b2.grid(row=9, column=0, columnspan=2, sticky="ew", pady=(4, 0))
         ttk.Button(b2, text="Ruhepose aufnehmen", command=self._record_rest).pack(side="left")
         ttk.Button(b2, text="Aufnahme abbrechen", command=self._cancel_rec).pack(side="left", padx=4)
 
@@ -1114,8 +1309,8 @@ class App:
         return None
 
     def _rebuild(self):
-        models, infos = build_models(self.data["poses"])
-        self.tracker.set_models(models, infos)
+        models, infos, motions = build_models(self.data["poses"])
+        self.tracker.set_models(models, infos, motions)
         self.tracker.set_fields(build_fields(self.data["felder"]))
 
     # ---------- Kamera-Felder ----------
@@ -1265,6 +1460,7 @@ class App:
             rest = p["zone"] == REST_ZONE
             self.tree.insert("", "end", iid=p["name"], text=p["name"], values=(
                 "Ruhepose" if rest else ZONE_LABELS[p["zone"]],
+                "–" if rest else ART_SHORT.get(p.get("art", "haltung"), ""),
                 "–" if rest or not p.get("keys") else p["keys"],
                 "–" if rest else MODE_SHORT.get(p.get("mode"), ""),
                 len(p["samples"])))
@@ -1303,6 +1499,9 @@ class App:
         if p["zone"] != REST_ZONE:
             self.zone_var.set(ZONE_LABELS[p["zone"]])
             self.mode_var.set(MODE_LABELS.get(p.get("mode"), MODE_LABELS["antippen"]))
+            self.art_var.set(ART_LABELS.get(p.get("art", "haltung"), ART_LABELS["haltung"]))
+            self.empf_var.set(float(p.get("empf", 1.0)))
+            self.empf_lbl.config(text=f"{float(p.get('empf', 1.0)):.1f}")
         self.key_var.set(p.get("keys", ""))
 
     def _form(self):
@@ -1319,7 +1518,9 @@ class App:
             messagebox.showerror(APP_TITLE, str(exc))
             return None
         mode = MODE_FROM_LABEL.get(self.mode_var.get(), "antippen")
-        return {"name": name, "zone": zone, "keys": keys, "mode": mode}
+        art = ART_FROM_LABEL.get(self.art_var.get(), "haltung")
+        empf = round(float(self.empf_var.get()), 2)
+        return {"name": name, "zone": zone, "keys": keys, "mode": mode, "art": art, "empf": empf}
 
     def _busy(self):
         if self.tracker.rec is not None:
@@ -1342,7 +1543,7 @@ class App:
             if not messagebox.askyesno(APP_TITLE, f"„{existing['name']}“ gibt es schon. "
                                                   "Weitere Samples zu dieser Pose aufnehmen?"):
                 return
-            form = {k: existing[k] for k in ("name", "zone", "keys", "mode")}
+            form = {k: existing.get(k) for k in POSE_KEYS if k in existing}
         self._start_rec(form)
 
     def _record_more(self):
@@ -1350,7 +1551,7 @@ class App:
         if not p:
             messagebox.showinfo(APP_TITLE, "Bitte zuerst eine Pose in der Liste auswählen.")
             return
-        self._start_rec({k: p.get(k, "") for k in ("name", "zone", "keys", "mode")})
+        self._start_rec({k: p[k] for k in POSE_KEYS if k in p})
 
     def _record_rest(self):
         rest = next((p for p in self.data["poses"] if p["zone"] == REST_ZONE), None)
@@ -1372,10 +1573,20 @@ class App:
             pose = dict(target)
             pose["samples"] = []
             self.data["poses"].append(pose)
+        pose.setdefault("fps", target.get("fps", 30.0))
         pose["samples"].extend(samples)
         self._save_now()
         self._refresh_tree(select=pose["name"])
         self._rebuild()
+        if pose["zone"] == REST_ZONE:  # neue Ruhepose: alle Posen dagegen prüfen
+            self._warn_similar([p["name"] for p in self.data["poses"] if p is not pose])
+        else:
+            self._warn_similar([pose["name"]])
+
+    def _warn_similar(self, names):
+        msgs = [m for m in (similarity_warning(self.data["poses"], n) for n in names) if m]
+        if msgs:
+            messagebox.showwarning(APP_TITLE, "Achtung, Verwechslungsgefahr:\n\n" + "\n\n".join(msgs))
 
     def _apply_edit(self):
         p = self._selected()
@@ -1391,10 +1602,12 @@ class App:
             return
         p["name"] = form["name"]
         if p["zone"] != REST_ZONE:
-            p.update(zone=form["zone"], keys=form["keys"], mode=form["mode"])
+            p.update(zone=form["zone"], keys=form["keys"], mode=form["mode"],
+                     art=form["art"], empf=form["empf"])
         self._save_now()
         self._refresh_tree(select=p["name"])
         self._rebuild()
+        self._warn_similar([p["name"]])
 
     def _delete(self):
         p = self._selected()
@@ -1473,6 +1686,9 @@ class App:
             if not zones and not self.data["felder"]:
                 lines.append("Noch keine Posen kalibriert." if not self.data["poses"]
                              else "Nimm noch eine Pose mit Bereich (nicht nur die Ruhepose) auf.")
+        for name, (e, thr, moving) in st.get("motions", {}).items():
+            val = "–" if e is None else f"{e:.2f}"
+            lines.append(f"{name} (Bewegung): {val} / Schwelle {thr:.2f}" + ("  ✔ aktiv" if moving else ""))
         if self.data["felder"]:
             act = st.get("fields", [])
             lines.append("Kamera-Felder: " + (", ".join(act) if act else "–"))

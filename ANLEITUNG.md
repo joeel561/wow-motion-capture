@@ -41,6 +41,24 @@ ignoriert, wenn sie nicht im Bild sind.
 - **Antippen** – einmal drücken beim Einnehmen der Pose (Zauber, Springen). Für die
   nächste Auslösung kurz in die Ruhepose zurück.
 
+### Erkennung: Haltung oder Bewegung
+
+- **Haltung** – eine Pose, die du stillhältst (Arm hoch, nach vorn lehnen).
+- **Bewegung** – zählt nur, solange sich der Bereich wirklich bewegt, z. B.
+  **auf der Stelle gehen = laufen**. Nimm die Pose dabei in Bewegung auf (3 s gehen).
+  Die Schwelle wird automatisch zwischen Ruhepose und deiner Aufnahme gesetzt;
+  der Status zeigt live „Bewegung: 0,21 / Schwelle 0,60“.
+
+Gehen auf der Stelle **muss** als *Bewegung* eingestellt sein – als *Haltung*
+sieht der Moment zwischen zwei Schritten genauso aus wie Stehen, und dann läuft
+der Charakter schon beim Stillstehen los.
+
+### Empfindlichkeit pro Pose
+
+Regler im Pose-Editor (0,3 – 2,0, Standard 1,0): kleiner = löst schwerer aus,
+größer = leichter. Danach **Änderungen übernehmen**. Zusätzlich gilt eine Haltung
+nur, wenn du ihr deutlich näher bist als der Ruhepose.
+
 Tasten: `w`, `1`, `space`, `shift+2`, `ctrl+1`, `f1`, `tab`, `num5`,
 `links/rechts/hoch/runter`, Maus: `lmb`, `rmb`, `mmb`, `maus4`, `maus5`.
 
@@ -70,7 +88,8 @@ Fuß im unteren Feld = Springen `space`.
 | Pose | Bereich | Taste | Modus |
 |---|---|---|---|
 | Ruhepose | – | – | – |
-| Vorlehnen | Rumpf | `w` | Halten |
+| Auf der Stelle gehen (Erkennung: Bewegung) | Beine | `w` | Halten |
+| Vorlehnen (Alternative zum Gehen) | Rumpf | `w` | Halten |
 | Zurücklehnen | Rumpf | `s` | Halten |
 | Links lehnen | Rumpf | `a` | Halten |
 | Rechts lehnen | Rumpf | `d` | Halten |
